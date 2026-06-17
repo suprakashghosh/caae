@@ -21,3 +21,4 @@ class UnifiedContextState(BaseModel):
     extracted_quantitative_data: dict[str, Any] = Field(default_factory=dict)
     execution_mutation_result: dict[str, Any] = Field(default_factory=dict)
     validation_retry_count: int = Field(default=0, le=3)
+    evaluation_passed: bool | None = None
