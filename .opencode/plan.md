@@ -384,7 +384,7 @@ llm = init_chat_model("claude-sonnet-4-20250514", model_provider="anthropic")
 
 ### Sub-Task 6: Validation Pipeline (Pydantic + DeepEval)
 
-- **Status:** Pending
+- **Status:** Completed
 - **Objective:** Implement the deterministic validation pipeline — Pydantic schema checking and DeepEval regression gates.
 - **Related Requirements:** R6, R9
 - **Dependencies and Preconditions:** Sub-Task 3 (state model, schema registry)
