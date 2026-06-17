@@ -1,0 +1,22 @@
+{
+  "client_profile_id": "med_spa_conversion_hub",
+  "intent_routing_matrix": {
+    "appointment_booking_request": {
+      "primary_mcp_server": "scheduling_engine",
+      "required_tools": ["check_availability", "book_slot"],
+      "runtime_schema_contract": "schemas.clinical.AppointmentBookingPayload",
+      "post_execution_state": "trigger_sms_nurture"
+    },
+    "competitor_intel_deep_dive": {
+      "primary_mcp_server": "youtube_analytics_crawler",
+      "required_tools": ["fetch_channel_metrics", "scrape_transcript"],
+      "runtime_schema_contract": "schemas.media.QuantitativeIntelPayload",
+      "post_execution_state": "compile_script_outline"
+    }
+  },
+  "global_constraints": {
+    "halt_on_negative_sentiment": true,
+    "enforce_strict_anti_slop": true,
+    "max_session_cost_usd": 2.50
+  }
+}

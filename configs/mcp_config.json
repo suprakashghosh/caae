@@ -1,0 +1,18 @@
+{
+  "system_mode": "production",
+  "active_environment": "enterprise_healthcare_sales",
+  "mcp_servers": {
+    "core_crm_gateway": {
+      "transport": "streamable_http",
+      "endpoint": "https://crm.client-api.internal/mcp/v1",
+      "timeout_ms": 5000,
+      "env_auth_token_key": "CRM_PROD_BEARER_TOKEN"
+    },
+    "scheduling_engine": {
+      "transport": "stdio",
+      "command": "uv",
+      "args": ["run", "caae-demo-server"],
+      "timeout_ms": 5000
+    }
+  }
+}
