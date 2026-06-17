@@ -2,8 +2,10 @@
 
 import asyncio
 import logging
+import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
+from typing import Any
 
 from mcp import ClientSession
 
@@ -55,6 +57,18 @@ class MCPClientManager:
         self._servers: dict[str, _ServerConnection] = {}
         self._exit_stack: AsyncExitStack | None = None
         self._started: bool = False
+        self._langfuse_handler: Any = None  # Optional LangfuseHandler
+        self._trace_context: dict[str, Any] | None = None
+
+    def set_langfuse_handler(self, handler: Any, trace_context: dict[str, Any] | None = None) -> None:
+        """Set the Langfuse handler for tool call tracing.
+
+        Args:
+            handler: A LangfuseHandler instance (or None to clear).
+            trace_context: Optional trace identifiers to attach to tool observations.
+        """
+        self._langfuse_handler = handler
+        self._trace_context = trace_context
 
     async def start(self, config: MCPConfig) -> None:
         """Initialize connections to all configured MCP servers.
@@ -177,23 +191,68 @@ class MCPClientManager:
         if connection is None:
             raise MCPConnectionError(f"Server '{server_name}' is not connected")
 
+        start_time = time.monotonic()
+
         try:
             result = await asyncio.wait_for(
                 connection.session.call_tool(tool_name, arguments),
                 timeout=connection.timeout_ms / 1000.0,  # Convert ms to seconds
             )
-            return {
+            latency_ms = (time.monotonic() - start_time) * 1000
+
+            return_dict = {
                 "content": result.content,
                 "is_error": result.isError,
                 "structured_content": result.structuredContent,
             }
+
+            # Record in Langfuse if handler is set
+            if self._langfuse_handler is not None:
+                lh = self._langfuse_handler
+                if lh.enabled:
+                    lh.record_tool_call(
+                        trace=None,
+                        server_name=server_name,
+                        tool_name=tool_name,
+                        arguments=arguments,
+                        result=return_dict,
+                        latency_ms=latency_ms,
+                        is_error=result.isError,
+                        trace_context=self._trace_context,
+                    )
+
+            return return_dict
         except TimeoutError:
+            latency_ms = (time.monotonic() - start_time) * 1000
+            if self._langfuse_handler is not None and self._langfuse_handler.enabled:
+                self._langfuse_handler.record_tool_call(
+                    trace=None,
+                    server_name=server_name,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    result=None,
+                    latency_ms=latency_ms,
+                    is_error=True,
+                    trace_context=self._trace_context,
+                )
             raise MCPToolError(
                 f"Tool call '{tool_name}' on server '{server_name}' timed out after {connection.timeout_ms}ms"
             ) from None
         except MCPToolError:
             raise
         except Exception as e:
+            latency_ms = (time.monotonic() - start_time) * 1000
+            if self._langfuse_handler is not None and self._langfuse_handler.enabled:
+                self._langfuse_handler.record_tool_call(
+                    trace=None,
+                    server_name=server_name,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    result=None,
+                    latency_ms=latency_ms,
+                    is_error=True,
+                    trace_context=self._trace_context,
+                )
             raise MCPToolError(f"Failed to call tool '{tool_name}' on server '{server_name}': {e}") from e
 
     async def list_tools(self, server_name: str) -> list[ToolInfo]:

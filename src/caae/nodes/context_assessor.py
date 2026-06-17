@@ -16,6 +16,11 @@ from caae.nodes.deps import Dependencies
 logger = logging.getLogger(__name__)
 
 
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token for English text."""
+    return max(1, len(text) // 4)
+
+
 class IntentClassification(BaseModel):
     """Structured output from the LLM intent classifier."""
 
@@ -70,6 +75,18 @@ async def context_assessor_node(state: dict[str, Any], config: RunnableConfig) -
     # ── Session ID ──────────────────────────────────────────────────────────
     session_id: str = state.get("session_id") or payload.get("session_id") or str(uuid.uuid4())
 
+    # ── Budget check before LLM call ──────────────────────────────────────
+    if deps.langfuse_handler is not None and deps.langfuse_handler.enabled:
+        max_cost = deps.workflow_policy.global_constraints.max_session_cost_usd
+        if not deps.langfuse_handler.is_within_budget(session_id, max_cost):
+            logger.warning(
+                "Session %s exceeds budget ($%.2f > $%.2f); returning unknown intent",
+                session_id,
+                deps.langfuse_handler.get_session_cost(session_id),
+                max_cost,
+            )
+            return {"session_id": session_id, "resolved_intent": "unknown"}
+
     # ── Intent classification via LLM ───────────────────────────────────────
     available_intents = list(deps.workflow_policy.intent_routing_matrix.keys())
     resolved_intent: str = "unknown"
@@ -83,6 +100,17 @@ async def context_assessor_node(state: dict[str, Any], config: RunnableConfig) -
 
         messages = _build_intent_prompt(available_intents, json.dumps(payload, default=str))
         result: IntentClassification = await structured_llm.ainvoke(messages)
+
+        # ── Estimate token costs for budget enforcement ─────────────────────
+        if deps.langfuse_handler is not None and deps.langfuse_handler.enabled:
+            prompt_text = "".join(m.content for m in messages if hasattr(m, "content"))
+            response_text = result.model_dump_json()
+            deps.langfuse_handler.track_cost(
+                session_id=session_id,
+                prompt_tokens=estimate_tokens(prompt_text),
+                completion_tokens=estimate_tokens(response_text),
+                model=deps.llm_model_name,
+            )
 
         if result.confidence >= 0.5 and result.intent in available_intents:
             resolved_intent = result.intent

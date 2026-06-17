@@ -14,6 +14,7 @@ from caae.models.config import WorkflowPolicy
 from caae.models.schemas import SchemaRegistry, get_default_registry
 from caae.models.state import UnifiedContextState
 from caae.nodes.deps import Dependencies
+from caae.observability.langfuse_handler import LangfuseHandler
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class CAAEEngine:
         self._workflow_policy: WorkflowPolicy | None = None
         self._schema_registry: SchemaRegistry | None = None
         self._graph: CompiledStateGraph | None = None
+        self._langfuse_handler: LangfuseHandler | None = None
 
         # In-memory session store (V1)
         self._sessions: dict[str, dict[str, Any]] = {}
@@ -71,15 +73,25 @@ class CAAEEngine:
         await mcp_client.start(mcp_config)
         self._mcp_client = mcp_client
 
+        # Initialize Langfuse observability handler
+        self._langfuse_handler = LangfuseHandler()
+        if self._langfuse_handler.enabled:
+            mcp_client.set_langfuse_handler(self._langfuse_handler)
+
         self._graph = build_caae_graph()
 
         logger.info("CAAEEngine started successfully")
 
     async def stop(self) -> None:
-        """Gracefully shut down MCP client connections."""
+        """Gracefully shut down MCP client connections and Langfuse handler."""
         if self._mcp_client is not None:
             await self._mcp_client.stop()
             self._mcp_client = None
+
+        if self._langfuse_handler is not None:
+            self._langfuse_handler.shutdown()
+            self._langfuse_handler = None
+
         logger.info("CAAEEngine stopped")
 
     async def run_session(self, event: dict[str, Any]) -> dict[str, Any]:
@@ -107,6 +119,18 @@ class CAAEEngine:
             inbound_event_payload=event,
         )
 
+        # ── Session trace root ─────────────────────────────────────────────
+        trace_span = None
+        trace_context: dict[str, Any] = {}
+        if self._langfuse_handler and self._langfuse_handler.enabled:
+            trace_span = self._langfuse_handler.start_span(
+                name="caae-session",
+                input_data=event,
+            )
+            if trace_span is not None:
+                trace_context["trace_root_id"] = str(id(trace_span))
+            self._mcp_client.set_langfuse_handler(self._langfuse_handler, trace_context)
+
         # Assemble runtime dependencies
         deps = Dependencies(
             mcp_client=self._mcp_client,
@@ -114,17 +138,34 @@ class CAAEEngine:
             schema_registry=self._schema_registry,
             llm_model_name=self._llm_model_name,
             llm_provider=self._llm_provider,
+            langfuse_handler=self._langfuse_handler,
         )
+
+        # Build LangGraph config with optional Langfuse callbacks
+        from langfuse.langchain import CallbackHandler as LangchainCallbackHandler
+
+        callbacks: list[Any] = []
+        if self._langfuse_handler and self._langfuse_handler.enabled:
+            callbacks.append(LangchainCallbackHandler())
+
+        config: dict[str, Any] = {"configurable": {"deps": deps}}
+        if callbacks:
+            config["callbacks"] = callbacks
 
         # Execute the graph
         final_state: UnifiedContextState = await self._graph.ainvoke(
             initial_state,
-            config={"configurable": {"deps": deps}},
+            config=config,
         )
 
         # Serialise and cache the result
         result: dict[str, Any] = final_state.model_dump()
         self._sessions[final_state.session_id] = result
+
+        # ── End session trace ──────────────────────────────────────────────
+        if trace_span is not None and self._langfuse_handler is not None:
+            self._langfuse_handler.end_span(trace_span, output_data=result)
+
         return result
 
     def get_session_state(self, session_id: str) -> dict[str, Any] | None:

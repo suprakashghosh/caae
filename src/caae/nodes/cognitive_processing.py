@@ -16,6 +16,14 @@ from caae.nodes.deps import Dependencies
 logger = logging.getLogger(__name__)
 
 
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token for English text.
+
+    Used for budget enforcement — exact counts come from Langfuse callback handler.
+    """
+    return max(1, len(text) // 4)
+
+
 def _get_deps(config: RunnableConfig) -> Dependencies:
     """Extract the Dependencies container from the LangGraph config."""
     return config["configurable"]["deps"]
@@ -87,6 +95,22 @@ async def cognitive_processing_node(state: dict[str, Any], config: RunnableConfi
         ),
     ]
 
+    # ── Budget check before LLM call ──────────────────────────────────────
+    # When budget is exceeded we return an error dict. The evaluation gate
+    # sees the error key, validation fails, retry count increments, and after
+    # 3 retries the graph escalates to human handoff — effectively halting.
+    if deps.langfuse_handler is not None and deps.langfuse_handler.enabled:
+        max_cost = deps.workflow_policy.global_constraints.max_session_cost_usd
+        session_id: str = state.get("session_id", "")
+        if not deps.langfuse_handler.is_within_budget(session_id, max_cost):
+            logger.warning(
+                "Session %s exceeds budget ($%.2f > $%.2f); skipping LLM call",
+                session_id,
+                deps.langfuse_handler.get_session_cost(session_id),
+                max_cost,
+            )
+            return {"extracted_quantitative_data": {"error": "session cost exceeds budget"}}
+
     # ── LLM structured inference ────────────────────────────────────────────
     try:
         llm: BaseChatModel = init_chat_model(
@@ -96,6 +120,20 @@ async def cognitive_processing_node(state: dict[str, Any], config: RunnableConfi
         structured_llm = llm.with_structured_output(schema_class)
 
         result: BaseModel = await structured_llm.ainvoke(messages)
+
+        # ── Estimate token costs for budget enforcement ─────────────────────
+        # with_structured_output returns a Pydantic model, not an AIMessage,
+        # so response_metadata is not available. Use rough char-based estimation.
+        # The Langfuse callback handler captures exact token usage in traces.
+        if deps.langfuse_handler is not None and deps.langfuse_handler.enabled:
+            prompt_text = "".join(m.content for m in messages if hasattr(m, "content"))
+            response_text = result.model_dump_json()
+            deps.langfuse_handler.track_cost(
+                session_id=state.get("session_id", ""),
+                prompt_tokens=estimate_tokens(prompt_text),
+                completion_tokens=estimate_tokens(response_text),
+                model=deps.llm_model_name,
+            )
 
         extracted: dict[str, Any] = result.model_dump()
         logger.info(
