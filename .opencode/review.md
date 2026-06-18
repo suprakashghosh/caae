@@ -1,83 +1,92 @@
 # Code Review Summary
 
-**Scope**: Sub-Task 7 — Langfuse Observability Integration: `src/caae/observability/langfuse_handler.py`, `src/caae/observability/__init__.py`, `src/caae/nodes/deps.py`, `src/caae/engine.py`, `src/caae/mcp/client_manager.py`, `src/caae/nodes/cognitive_processing.py`, `tests/unit/test_observability.py`.
+**Scope**: Sub-Task 8 — Demo MCP Server (Scheduling Engine)
+**Files reviewed**: `data.py`, `server.py`, `__main__.py`, `__init__.py`, `test_demo_server.py`, `mcp_config.json`, `pyproject.toml`, `test_config_models.py`
+**Overall risk**: Low (for demo server itself) / Medium (one cross-cutting bug found)
+**Verdict**: Approve with comments — one P1 fix and one P0 cross-cutting bug found
 
-**Overall risk**: High
-
-**Verdict**: Request changes
-
-## Findings
-
-### [P0] Blocking
-
-- **Budget enforcement cannot trigger on real LLM usage because token usage is read from the structured-output Pydantic model**
-  - **Location**: `src/caae/nodes/cognitive_processing.py:109-122`
-  - **Why it matters**: The node calls `structured_llm = llm.with_structured_output(schema_class)` and awaits it. The returned value is an instance of `schema_class` (a Pydantic `BaseModel`), not a LangChain `AIMessage`. Pydantic models do not carry `response_metadata`, so `hasattr(result, "response_metadata")` is `False` and `track_cost()` is always called with zero tokens. The internal session cost stays at `0.0`, so `is_within_budget()` will never detect an over-budget session in production.
-  - **Evidence**: Code checks `result.response_metadata` after `with_structured_output`; LangChain's `with_structured_output` strips message metadata and returns the parsed schema object. Tests bypass this by mocking `init_chat_model` and the budget check itself.
-  - **Fix**: Either (a) invoke the base LLM (`await llm.ainvoke(messages)`) to obtain the `AIMessage` with `response_metadata`, then parse it through the schema, or (b) attach a callback that captures token usage and feed the totals into `track_cost()`.
-
-- **Budget enforcement is node-local and does not halt the session**
-  - **Location**: `src/caae/nodes/cognitive_processing.py:91-101`, `src/caae/graph.py:32-37`
-  - **Why it matters**: The acceptance criterion says "if cost exceeds max_session_cost_usd, the session is halted". The current check only runs immediately before the cognitive-processing LLM call. It returns `{"extracted_quantitative_data": {"error": "session cost exceeds budget"}}`, but LangGraph's linear edges still route to `action_execution`, which then runs with the error payload. The graph is not stopped.
-  - **Evidence**: `graph.add_edge("cognitive_processing", "action_execution")` is unconditional. `action_execution_node` receives `extracted_quantitative_data.error` and calls tools with it.
-  - **Fix**: Centralize budget tracking across all LLM calls (including `context_assessor_node`) and halt the graph by raising a dedicated `BudgetExceededError` from the node, then catch it in `CAAEEngine.run_session` and return/record a final budget-exceeded state. Alternatively, add a conditional edge after the budget check that routes to `END`.
-
-### [P1] High
-
-- **Manual tool-call observations are not linked to the CallbackHandler trace**
-  - **Location**: `src/caae/observability/langfuse_handler.py:111-149`, `src/caae/engine.py:133-141`
-  - **Why it matters**: The acceptance criterion requires "a Langfuse trace with 5 node spans + tool call spans + cost records". The engine never creates a session trace root, and `record_tool_call()` calls `self._client.start_observation()` without a `trace_context`. Each MCP tool call therefore becomes a separate orphan trace (or a trace with no parent), not a child span of the session trace produced by `LangchainCallbackHandler`.
-  - **Evidence**: `LangfuseHandler.start_trace()` is defined but never invoked. `record_tool_call()` ignores its `trace` argument and does not pass `trace_context={"trace_id": ..., "parent_observation_id": ...}` to `start_observation()`.
-  - **Fix**: In `CAAEEngine.run_session`, create a session trace via `self._langfuse_handler.start_trace(session_id)` and pass its `trace_id` (and optionally the root span `id`) as `trace_context` to both `LangchainCallbackHandler(trace_context=...)` and `record_tool_call()`. Update `record_tool_call()` to accept and forward `trace_context`.
-
-- **Cost tracking only covers the cognitive-processing LLM call**
-  - **Location**: `src/caae/nodes/context_assessor.py:78-85`, `src/caae/nodes/cognitive_processing.py:109-122`
-  - **Why it matters**: `context_assessor_node` also invokes an LLM (`init_chat_model().with_structured_output(IntentClassification)`), but it never calls `track_cost()` or `is_within_budget()`. A session can exceed its budget during intent classification before the cognitive-processing check ever runs.
-  - **Evidence**: No references to `langfuse_handler` in `context_assessor.py`.
-  - **Fix**: Track token usage in `context_assessor_node` the same way as in `cognitive_processing_node` (after fixing the metadata extraction issue), and perform the budget check before any billable LLM call.
-
-### [P2] Medium
-
-- **`LangfuseHandler._is_configured()` ignores constructor arguments**
-  - **Location**: `src/caae/observability/langfuse_handler.py:17-35,38-42`
-  - **Why it matters**: If a caller passes `public_key`/`secret_key` explicitly but does not set environment variables, `_enabled` is `False` even though the underlying `Langfuse` client is configured and would emit traces.
-  - **Evidence**: `_is_configured()` only reads `os.environ.get("LANGFUSE_PUBLIC_KEY")` and `LANGFUSE_SECRET_KEY`; it never inspects `self._client`'s init args.
-  - **Fix**: Check the supplied `public_key`/`secret_key` arguments in addition to the environment variables, e.g. `return bool(public_key or secret_key or os.environ.get(...))`.
-
-- **`record_tool_call()` accepts an unused `trace` parameter**
-  - **Location**: `src/caae/observability/langfuse_handler.py:111-120`
-  - **Why it matters**: The parameter suggests parent-trace linking is supported, but it is never used. Callers in `MCPClientManager` always pass `trace=None`, and the method creates unparented observations.
-  - **Evidence**: `trace` is not referenced inside the method body.
-  - **Fix**: Either remove the parameter or convert it into a `trace_context` dict and pass it to `start_observation()`.
-
-- **Two Langfuse client instances may flush independently**
-  - **Location**: `src/caae/engine.py:77,137`, `src/caae/observability/langfuse_handler.py:30`
-  - **Why it matters**: `LangfuseHandler` creates a `Langfuse()` client, while `LangchainCallbackHandler()` internally calls `get_client()` which may return a singleton in simple setups. In multi-project or explicitly-constructed-client scenarios the two can diverge, leading to partial flushes or traces split across clients.
-  - **Evidence**: `CallbackHandler` uses `get_client(public_key=None)`, not the `LangfuseHandler._client` instance.
-  - **Fix**: Reuse a single client instance. Construct `CallbackHandler(public_key=...)` or, better, expose the handler's client to the callback if the SDK supports it; at minimum, ensure both use identical credentials and flush both on shutdown.
-
-### [P3] Low
-
-- **Test file has unused imports and an unused local variable**
-  - **Location**: `tests/unit/test_observability.py:3,8,423`
-  - **Why it matters**: `import os`, `MCPConnectionError`, and `result = await manager.call_tool(...)` are unused. `ruff check` flags them.
-  - **Evidence**: `ruff check tests/unit/test_observability.py` reports `F401` and `F841`.
-  - **Fix**: Remove the unused imports and variable assignment.
+---
 
 ## Positive Notes
 
-- The Langfuse v4 API usage in `langfuse_handler.py` (`start_observation`, `update`, `end`, `as_type="tool"`) matches the SDK signatures.
-- `from langfuse.langchain import CallbackHandler` is the correct v4 import path.
-- Disabled-mode no-ops are consistently guarded by `_enabled` checks in `LangfuseHandler`, and the engine only adds the LangGraph callback when `handler.enabled` is `True`.
-- MCP tool-call timeout detection and latency recording are implemented correctly in `client_manager.call_tool()`.
-- Pricing math in `track_cost()` matches the stated per-1k-token table, and the 22 unit tests pass (`pytest tests/unit/test_observability.py -v`).
+- **Clean separation of concerns**: `data.py` (pure logic) / `server.py` (FastMCP binding) / `__main__.py` (entry point). Each layer is minimal and testable independently.
+- **Double-booking prevention correct**: `book_appointment` checks `status == "confirmed"` before booking, so cancelled slots are re-bookable. Correct.
+- **Idempotent cancel**: Cancelling an already-cancelled appointment returns "cancelled" (not an error). Acceptable for demo.
+- **Integration tests thorough**: Tests cover tool discovery, schema validation, full lifecycle (check→book→verify unavailable→list→cancel→verify), double-booking rejection, not-found cases, unknown practitioners.
+- **Ruff/mypy clean**: Zero ruff violations, zero mypy errors across all 4 demo server source files.
+- **Pre-populated store correct**: 3 practitioners (`dr-smith`, `dr-jones`, `dr-wilson`), slot generation produces 16 × 30-min slots (09:00–17:00 UTC).
+- **Tool schemas valid JSON Schema**: All 4 tools verified to have `type: "object"` with `properties` dict. Parameter names match expectations.
+- **Config integration works**: `mcp_config.json` parsed correctly by `MCPConfig` model; discriminated union discriminates `stdio` vs `streamable_http`.
+- **`pyproject.toml` entry correct**: `caae-demo-server = "caae_demo_server.__main__:main"` wired correctly.
+
+---
+
+## Findings
+
+### [P0] Blocking — `create_streamable_http_connection` yields 3-tuple but caller unpacks 2
+
+- **Location**: `src/caae/mcp/transport.py:82-83,88-89` (yields 3-tuple) → `src/caae/mcp/client_manager.py:107-108` (unpacks 2)
+- **Why it matters**: Any MCP server configured with `transport: "streamable_http"` (including `core_crm_gateway` in `mcp_config.json`) will **crash at startup** with `ValueError: too many values to unpack`. The demo server itself uses `stdio` and is unaffected, but this is a production blocker for the `core_crm_gateway` integration.
+- **Evidence**:
+  - `transport.py:82`: `yield (read, write, get_session_id)` — 3 values
+  - `transport.py:88`: `yield (read, write, get_session_id)` — 3 values
+  - `client_manager.py:107-108`: `read, write = await self._exit_stack.enter_async_context(create_streamable_http_connection(...))` — destructures into 2 variables
+  - Unit test `mock_transport_cm` fixture (line 286) returns a 2-tuple for both transports, masking the bug
+- **Fix**: Either (a) unpack all 3: `read, write, _session_id = await ...` or (b) if `get_session_id` is not needed, change the transport to not yield it: `yield (read, write)`. Option (b) is simpler since `ClientSession` only takes `(read, write)`.
+
+### [P1] High — `cancel_appointment` returns inconsistent shape for "not_found"
+
+- **Location**: `src/caae_demo_server/data.py:147`
+- **Why it matters**: The docstring promises `{"appointment_id": ..., "status": ...}`, but the "not_found" path returns `{"status": "not_found"}` without `appointment_id`. Any LLM or client destructuring `result["appointment_id"]` will get a `KeyError`.
+- **Evidence**:
+  - `data.py:133-146`: Docstring says "Dict with `appointment_id` and `status`"
+  - `data.py:147`: `return {"status": "not_found"}` — missing `appointment_id`
+  - The successful path (line 146) returns both keys
+  - The integration test at line 223 only checks `cancel_data2["status"] == "not_found"`, not missing `appointment_id`
+- **Fix**: Change line 147 to `return {"appointment_id": appointment_id, "status": "not_found"}`
+
+### [P2] Medium — `_generate_slots_for_date` crashes on invalid date strings
+
+- **Location**: `src/caae_demo_server/data.py:41`
+- **Why it matters**: `datetime.strptime(date_str, "%Y-%m-%d")` raises `ValueError` for malformed dates (e.g., "2024-13-01", "not-a-date"). FastMCP will propagate this as an unhandled exception to the MCP client. No graceful error message.
+- **Evidence**: No try/except in the call chain from `check_availability` → `get_available_slots` → `_generate_slots_for_date`.
+- **Fix**: Wrap `_generate_slots_for_date` in try/except `ValueError`, return `[]` or raise a descriptive error. Alternatively, add Pydantic validation on the tool parameter or document that the caller must pre-validate.
+
+### [P2] Medium — `list_appointments` returns cancelled appointments without filter
+
+- **Location**: `src/caae_demo_server/data.py:109-130`
+- **Why it matters**: Cancelled appointments interleave with confirmed ones. No parameter to filter by status. LLM consumers may misinterpret cancelled appointments as active. The integration test (line 207-214) verifies cancelled appointments still appear — this is intentional but limits the tool's usefulness.
+- **Evidence**: `list_appointments_for_practitioner` returns all appointments regardless of status. No `status` filter parameter.
+- **Fix**: Add an optional `status: str | None = None` parameter. If provided, filter the returned list.
+
+### [P2] Medium — `mcp_config.json` contains duplicate `scheduling_engine` / `demo_scheduling` entries
+
+- **Location**: `configs/mcp_config.json:11-22`
+- **Why it matters**: Both entries launch separate `caae-demo-server` processes with independent in-memory state. A booking made via `scheduling_engine` won't appear in `demo_scheduling` and vice versa. The `workflow_policy.json` references `scheduling_engine`, but tests use `demo_scheduling`. This split is fragile and could confuse operators.
+- **Evidence**: Lines 11-16 (`scheduling_engine`) and 17-22 (`demo_scheduling`) are identical except for the server name.
+- **Fix**: Either consolidate into a single entry (update tests and policy to use the same name) or clearly document in the config that they are independent demo instances.
+
+### [P3] Low — `book_appointment` returns `"unavailable"` for unknown practitioners (semantically misleading)
+
+- **Location**: `src/caae_demo_server/data.py:84-85`
+- **Why it matters**: When `practitioner_id` is not in `PRACTITIONERS`, the function returns `{"status": "unavailable"}`. But the slot isn't "unavailable" — the practitioner doesn't exist. The same return value is used for genuinely booked slots (line 89), conflating two different error conditions.
+- **Fix**: Return `{"status": "error", "detail": "Unknown practitioner"}` or a separate error code.
+
+### [P3] Low — No `__all__` or explicit exports in `caae_demo_server/__init__.py`
+
+- **Location**: `src/caae_demo_server/__init__.py:1`
+- **Why it matters**: The package has a single docstring line. No explicit public API exported. Low impact since this is a runnable entry point, not an importable library.
+- **Fix**: Add `__all__ = []` or export the `mcp` instance for programmatic use.
+
+---
 
 ## Suggested Next Steps
 
-- [ ] Fix token-usage extraction so `track_cost()` receives real prompt/completion counts (P0).
-- [ ] Move the budget check to a central point and halt the graph on overrun, covering both `context_assessor_node` and `cognitive_processing_node` (P0).
-- [ ] Create a session trace root in `CAAEEngine.run_session` and wire `trace_context` through `LangchainCallbackHandler` and `record_tool_call()` so tool spans belong to the same trace (P1).
-- [ ] Update `_is_configured()` to honor explicit constructor credentials (P2).
-- [ ] Remove or use the unused `trace` parameter in `record_tool_call()` (P2).
-- [ ] Clean up unused imports/variables in `tests/unit/test_observability.py` (P3).
-- [ ] Re-run `pytest tests/unit/test_observability.py`, `ruff check`, and a real Langfuse smoke test to verify end-to-end traces, tool spans, and cost records.
+- [ ] **[P0]** Fix the streamable_http 3-tuple → 2-tuple unpacking bug in `client_manager.py` (also fix `mock_transport_cm` to use 3-tuple for streamable_http tests)
+- [ ] **[P1]** Add `appointment_id` to the `cancel_appointment` "not_found" return dict
+- [ ] **[P2]** Wrap `_generate_slots_for_date` in try/except for invalid date strings
+- [ ] **[P2]** Add optional `status` filter to `list_appointments_for_practitioner`
+- [ ] **[P2]** Consider consolidating `scheduling_engine` / `demo_scheduling` config entries
+- [ ] **[P3]** Differentiate return statuses for unknown-practitioner vs genuinely-booked slots
+- [ ] **Test**: Add unit test for `data.py` functions directly (faster feedback than full integration tests)
+- [ ] **Test**: After P0 fix, add integration test that exercises streamable_http transport (mock HTTP server)

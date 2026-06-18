@@ -12,7 +12,7 @@
       "transport": "stdio",
       "command": "uv",
       "args": ["run", "caae-demo-server"],
-      "timeout_ms": 5000
+      "timeout_ms": 10000
     }
   }
 }

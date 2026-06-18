@@ -459,7 +459,7 @@ llm = init_chat_model("claude-sonnet-4-20250514", model_provider="anthropic")
 
 ### Sub-Task 8: Demo MCP Server — Scheduling Engine
 
-- **Status:** Pending
+- **Status:** Completed
 - **Objective:** Build a functional in-memory scheduling MCP server as a reference implementation and demo, exposing tools that the core engine can invoke.
 - **Related Requirements:** R12
 - **Dependencies and Preconditions:** Sub-Task 4 (MCP client manager can connect to servers)

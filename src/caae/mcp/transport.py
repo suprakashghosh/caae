@@ -47,10 +47,10 @@ async def create_stdio_connection(
 @asynccontextmanager
 async def create_streamable_http_connection(
     config: StreamableHttpMCPServerConfig,
-) -> AsyncGenerator[tuple[object, object, object], None]:
+) -> AsyncGenerator[tuple[object, object], None]:
     """Create a Streamable HTTP transport connection to an MCP server.
 
-    Yields (read_stream, write_stream, get_session_id) from
+    Yields (read_stream, write_stream) from
     mcp.client.streamable_http.streamable_http_client.
     Handles auth token injection via httpx.AsyncClient if env_auth_token_key is set.
 
@@ -58,9 +58,7 @@ async def create_streamable_http_connection(
         config: The streamable HTTP server configuration.
 
     Yields:
-        A tuple of (read_stream, write_stream, get_session_id) for bidirectional
-        communication. The third element is a ``get_session_id`` callback that
-        callers can use if needed.
+        A tuple of (read_stream, write_stream) for bidirectional communication.
 
     Raises:
         MCPConnectionError: If the connection cannot be established, or if the
@@ -79,13 +77,13 @@ async def create_streamable_http_connection(
         )
         try:
             async with http_client:
-                async with streamable_http_client(url, http_client=http_client) as (read, write, get_session_id):
-                    yield (read, write, get_session_id)
+                async with streamable_http_client(url, http_client=http_client) as (read, write, _):
+                    yield (read, write)
         except Exception as e:
             raise MCPConnectionError(f"Failed to create streamable HTTP connection to '{url}': {e}") from e
     else:
         try:
-            async with streamable_http_client(url) as (read, write, get_session_id):
-                yield (read, write, get_session_id)
+            async with streamable_http_client(url) as (read, write, _):
+                yield (read, write)
         except Exception as e:
             raise MCPConnectionError(f"Failed to create streamable HTTP connection to '{url}': {e}") from e

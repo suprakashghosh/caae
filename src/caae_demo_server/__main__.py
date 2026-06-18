@@ -1,10 +1,11 @@
 """Entry point for the demo MCP server."""
 
+from caae_demo_server.server import mcp
+
 
 def main() -> None:
-    """Start the demo MCP server."""
-    # TODO: Implement demo server startup in subsequent sub-tasks
-    print("CAAE Demo MCP Server starting...")
+    """Start the demo MCP server (stdio transport)."""
+    mcp.run()
 
 
 if __name__ == "__main__":

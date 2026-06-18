@@ -60,7 +60,7 @@ class TestLoadValidConfigs:
         assert sched.transport == "stdio"
         assert sched.command == "uv"
         assert sched.args == ["run", "caae-demo-server"]
-        assert sched.timeout_ms == 5000
+        assert sched.timeout_ms == 10000
 
     def test_load_valid_workflow_policy(self, workflow_policy_path: Path) -> None:
         """Load the example workflow_policy.json and verify field values."""
