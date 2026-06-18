@@ -1,5 +1,6 @@
 """LangGraph builder — constructs the state-graph pipeline for CAAE."""
 
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
@@ -14,8 +15,13 @@ from caae.nodes import (
 )
 
 
-def build_caae_graph() -> CompiledStateGraph:
+def build_caae_graph(checkpointer: MemorySaver | None = None) -> CompiledStateGraph:
     """Build and compile the CAAE LangGraph.
+
+    Args:
+        checkpointer: Optional ``MemorySaver`` (or other ``BaseCheckpointSaver``)
+            for in-memory state persistence across node runs.
+            Defaults to ``None`` for backward compatibility with existing tests.
 
     Returns:
         A compiled LangGraph StateGraph ready for invocation.
@@ -47,5 +53,8 @@ def build_caae_graph() -> CompiledStateGraph:
         },
     )
 
-    compiled: CompiledStateGraph = graph.compile()
+    if checkpointer is not None:
+        compiled = graph.compile(checkpointer=checkpointer)  # type: ignore[arg-type]
+    else:
+        compiled = graph.compile()
     return compiled

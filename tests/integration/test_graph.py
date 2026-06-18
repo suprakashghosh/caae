@@ -7,6 +7,7 @@ No real external services required.
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langgraph.checkpoint.memory import MemorySaver
 
 from caae.graph import build_caae_graph
 from caae.mcp.models import ToolInfo
@@ -406,6 +407,59 @@ class TestGraphPipeline:
             "evaluation_gate",
         }
         assert expected.issubset(node_names), f"Missing nodes. Expected subset {expected}, got {node_names}"
+
+    # ── Checkpointer integration ─────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_graph_with_checkpointer(self):
+        """Graph compiled with MemorySaver checkpointer runs and returns state correctly."""
+        mcp_client = _mock_mcp_client(
+            tools=[
+                ToolInfo(name="check_availability", input_schema={"type": "object", "properties": {}}),
+                ToolInfo(name="book_slot", input_schema={"type": "object", "properties": {}}),
+            ],
+            tool_schema={"type": "object", "properties": {}},
+            call_result={"content": [{"text": "ok"}], "is_error": False},
+        )
+        deps = Dependencies(
+            mcp_client=mcp_client,
+            workflow_policy=_appointment_policy(),
+            schema_registry=_schema_registry_with_appointment(),
+        )
+        graph = build_caae_graph(checkpointer=MemorySaver())
+        initial_state = UnifiedContextState(
+            session_id="checkpointer-test",
+            inbound_event_payload={"message": "Book appointment"},
+        )
+
+        intent_result = IntentClassification(
+            intent="appointment_booking_request",
+            confidence=0.95,
+            reasoning="matches appointment pattern",
+        )
+        cognitive_result = AppointmentBookingPayload(
+            lead_id="L123",
+            practitioner_id="dr-smith",
+            preferred_date="2024-01-15",
+            preferred_time="10:00",
+            appointment_type="initial_consultation",
+        )
+
+        patcher_ctx = self._patch_context_assessor_llm(intent_result)
+        patcher_cog = self._patch_cognitive_llm(cognitive_result)
+        try:
+            result = await graph.ainvoke(
+                initial_state,
+                config={"configurable": {"deps": deps, "thread_id": "test-thread"}},
+            )
+        finally:
+            patcher_cog.stop()
+            patcher_ctx.stop()
+
+        assert result["resolved_intent"] == "appointment_booking_request"
+        assert result["evaluation_passed"] is True
+        assert result["session_id"] == "checkpointer-test"
+        assert len(result["mcp_retrieved_resources"]) == 1
 
     # ── Retry-loop routing ───────────────────────────────────────────────
 

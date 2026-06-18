@@ -1,92 +1,193 @@
-# Code Review Summary
+# Code Review: Sub-Task 9 — FastAPI Host Application (Session Management API)
 
-**Scope**: Sub-Task 8 — Demo MCP Server (Scheduling Engine)
-**Files reviewed**: `data.py`, `server.py`, `__main__.py`, `__init__.py`, `test_demo_server.py`, `mcp_config.json`, `pyproject.toml`, `test_config_models.py`
-**Overall risk**: Low (for demo server itself) / Medium (one cross-cutting bug found)
-**Verdict**: Approve with comments — one P1 fix and one P0 cross-cutting bug found
+**Reviewed by:** Automated Review  
+**Date:** 2026-06-18  
+**Scope:** 8 files, 219 tests, 0 lint violations
 
 ---
 
-## Positive Notes
+## Summary
 
-- **Clean separation of concerns**: `data.py` (pure logic) / `server.py` (FastMCP binding) / `__main__.py` (entry point). Each layer is minimal and testable independently.
-- **Double-booking prevention correct**: `book_appointment` checks `status == "confirmed"` before booking, so cancelled slots are re-bookable. Correct.
-- **Idempotent cancel**: Cancelling an already-cancelled appointment returns "cancelled" (not an error). Acceptable for demo.
-- **Integration tests thorough**: Tests cover tool discovery, schema validation, full lifecycle (check→book→verify unavailable→list→cancel→verify), double-booking rejection, not-found cases, unknown practitioners.
-- **Ruff/mypy clean**: Zero ruff violations, zero mypy errors across all 4 demo server source files.
-- **Pre-populated store correct**: 3 practitioners (`dr-smith`, `dr-jones`, `dr-wilson`), slot generation produces 16 × 30-min slots (09:00–17:00 UTC).
-- **Tool schemas valid JSON Schema**: All 4 tools verified to have `type: "object"` with `properties` dict. Parameter names match expectations.
-- **Config integration works**: `mcp_config.json` parsed correctly by `MCPConfig` model; discriminated union discriminates `stdio` vs `streamable_http`.
-- **`pyproject.toml` entry correct**: `caae-demo-server = "caae_demo_server.__main__:main"` wired correctly.
+Implementation is **solid V1 foundation**. Lifespan wiring correct, endpoints exist and behave per spec, MemorySaver wired. 219/219 tests pass, ruff clean. Critical gap: fire-and-forget background tasks swallow graph failures silently — user polls stale placeholder forever.
 
 ---
 
 ## Findings
 
-### [P0] Blocking — `create_streamable_http_connection` yields 3-tuple but caller unpacks 2
+### [P1] — Blocking / Must-Fix
 
-- **Location**: `src/caae/mcp/transport.py:82-83,88-89` (yields 3-tuple) → `src/caae/mcp/client_manager.py:107-108` (unpacks 2)
-- **Why it matters**: Any MCP server configured with `transport: "streamable_http"` (including `core_crm_gateway` in `mcp_config.json`) will **crash at startup** with `ValueError: too many values to unpack`. The demo server itself uses `stdio` and is unaffected, but this is a production blocker for the `core_crm_gateway` integration.
-- **Evidence**:
-  - `transport.py:82`: `yield (read, write, get_session_id)` — 3 values
-  - `transport.py:88`: `yield (read, write, get_session_id)` — 3 values
-  - `client_manager.py:107-108`: `read, write = await self._exit_stack.enter_async_context(create_streamable_http_connection(...))` — destructures into 2 variables
-  - Unit test `mock_transport_cm` fixture (line 286) returns a 2-tuple for both transports, masking the bug
-- **Fix**: Either (a) unpack all 3: `read, write, _session_id = await ...` or (b) if `get_session_id` is not needed, change the transport to not yield it: `yield (read, write)`. Option (b) is simpler since `ClientSession` only takes `(read, write)`.
+#### 1. Unhandled background task exceptions silently lost
 
-### [P1] High — `cancel_appointment` returns inconsistent shape for "not_found"
+**Files:** `src/caae/api/routes/sessions.py:40`, `sessions.py:72`
 
-- **Location**: `src/caae_demo_server/data.py:147`
-- **Why it matters**: The docstring promises `{"appointment_id": ..., "status": ...}`, but the "not_found" path returns `{"status": "not_found"}` without `appointment_id`. Any LLM or client destructuring `result["appointment_id"]` will get a `KeyError`.
-- **Evidence**:
-  - `data.py:133-146`: Docstring says "Dict with `appointment_id` and `status`"
-  - `data.py:147`: `return {"status": "not_found"}` — missing `appointment_id`
-  - The successful path (line 146) returns both keys
-  - The integration test at line 223 only checks `cancel_data2["status"] == "not_found"`, not missing `appointment_id`
-- **Fix**: Change line 147 to `return {"appointment_id": appointment_id, "status": "not_found"}`
+`asyncio.create_task(engine.run_session(...))` creates a fire-and-forget task. If graph execution raises (LLM failure, MCP timeout, config error), exception is silently dropped — no logging, no error stored in session state. User polling `GET /sessions/{id}` sees the placeholder with `evaluation_passed: None` **forever** with zero indication of failure.
 
-### [P2] Medium — `_generate_slots_for_date` crashes on invalid date strings
+**Fix:** Wrap in a handler that catches exceptions and stores error state:
 
-- **Location**: `src/caae_demo_server/data.py:41`
-- **Why it matters**: `datetime.strptime(date_str, "%Y-%m-%d")` raises `ValueError` for malformed dates (e.g., "2024-13-01", "not-a-date"). FastMCP will propagate this as an unhandled exception to the MCP client. No graceful error message.
-- **Evidence**: No try/except in the call chain from `check_availability` → `get_available_slots` → `_generate_slots_for_date`.
-- **Fix**: Wrap `_generate_slots_for_date` in try/except `ValueError`, return `[]` or raise a descriptive error. Alternatively, add Pydantic validation on the tool parameter or document that the caller must pre-validate.
+```python
+async def _run_session_safely(engine, payload, session_id):
+    try:
+        await engine.run_session(payload, session_id)
+    except Exception:
+        logger.exception("Session %s failed", session_id)
+        engine._sessions[session_id] = {
+            **engine._sessions.get(session_id, {}),
+            "error": "session execution failed",
+            "evaluation_passed": False,
+        }
+```
 
-### [P2] Medium — `list_appointments` returns cancelled appointments without filter
+Then use `asyncio.create_task(_run_session_safely(...))`.
 
-- **Location**: `src/caae_demo_server/data.py:109-130`
-- **Why it matters**: Cancelled appointments interleave with confirmed ones. No parameter to filter by status. LLM consumers may misinterpret cancelled appointments as active. The integration test (line 207-214) verifies cancelled appointments still appear — this is intentional but limits the tool's usefulness.
-- **Evidence**: `list_appointments_for_practitioner` returns all appointments regardless of status. No `status` filter parameter.
-- **Fix**: Add an optional `status: str | None = None` parameter. If provided, filter the returned list.
+#### 2. `cancel_session` returns 200 for "not_implemented"
 
-### [P2] Medium — `mcp_config.json` contains duplicate `scheduling_engine` / `demo_scheduling` entries
+**File:** `src/caae/api/routes/sessions.py:84`
 
-- **Location**: `configs/mcp_config.json:11-22`
-- **Why it matters**: Both entries launch separate `caae-demo-server` processes with independent in-memory state. A booking made via `scheduling_engine` won't appear in `demo_scheduling` and vice versa. The `workflow_policy.json` references `scheduling_engine`, but tests use `demo_scheduling`. This split is fragile and could confuse operators.
-- **Evidence**: Lines 11-16 (`scheduling_engine`) and 17-22 (`demo_scheduling`) are identical except for the server name.
-- **Fix**: Either consolidate into a single entry (update tests and policy to use the same name) or clearly document in the config that they are independent demo instances.
+Stub endpoint returns HTTP 200 with `{"status": "not_implemented"}`. Misleading — client gets success status for an unimplemented feature.
 
-### [P3] Low — `book_appointment` returns `"unavailable"` for unknown practitioners (semantically misleading)
+**Fix:** Return HTTP 501 Not Implemented:
+```python
+from fastapi import status
+raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="cancel not implemented")
+```
 
-- **Location**: `src/caae_demo_server/data.py:84-85`
-- **Why it matters**: When `practitioner_id` is not in `PRACTITIONERS`, the function returns `{"status": "unavailable"}`. But the slot isn't "unavailable" — the practitioner doesn't exist. The same return value is used for genuinely booked slots (line 89), conflating two different error conditions.
-- **Fix**: Return `{"status": "error", "detail": "Unknown practitioner"}` or a separate error code.
+---
 
-### [P3] Low — No `__all__` or explicit exports in `caae_demo_server/__init__.py`
+### [P2] — High Priority
 
-- **Location**: `src/caae_demo_server/__init__.py:1`
-- **Why it matters**: The package has a single docstring line. No explicit public API exported. Low impact since this is a runnable entry point, not an importable library.
-- **Fix**: Add `__all__ = []` or export the `mcp` instance for programmatic use.
+#### 3. Route violates encapsulation — directly mutates `engine._sessions`
+
+**Files:** `src/caae/api/routes/sessions.py:28-37`, `sessions.py:61-70`
+
+Routes write placeholder state dicts directly into the engine's private `_sessions` dict. This bypasses the engine's API surface (`get_session_state`, `run_session`) and couples routes to engine internals.
+
+**Fix:** Add a public method to `CAAEEngine`:
+```python
+def initialize_session(self, session_id: str, payload: dict[str, Any]) -> None:
+    self._sessions[session_id] = { ... }
+```
+
+Then routes call `engine.initialize_session(session_id, payload.payload)` instead of accessing `_sessions`.
+
+#### 4. `SessionStateResponse` duplicates `UnifiedContextState` almost verbatim
+
+**Files:** `src/caae/api/models.py:40-50` vs `src/caae/models/state.py:8-24`
+
+Both models have identical field names and types. `SessionStateResponse` omits the `le=3` constraint on `validation_retry_count`. Any field addition/rename requires touching two files.
+
+**Options:**
+- Use `UnifiedContextState` directly as the response model (via `response_model=UnifiedContextState` on the route)
+- Extract shared fields into a `_SessionStateBase(BaseModel)` mixin
+
+#### 5. No integration test for checkpointer-enabled graph path
+
+**File:** `tests/integration/test_graph.py`
+
+All 9 graph integration tests call `build_caae_graph()` **without** a checkpointer. The engine always calls `build_caae_graph(checkpointer=MemorySaver())`. The checkpointer path (which may change `ainvoke` return type) has zero runtime test coverage at the graph level.
+
+**Fix:** Add a test that passes `checkpointer=MemorySaver()` and verifies state retrieval works.
+
+#### 6. `POST /sessions/{session_id}/events` ignores the `session_id` path parameter
+
+**File:** `src/caae/api/routes/sessions.py:55-74`
+
+The endpoint accepts `session_id` in the URL but never uses it — always creates a brand new session. While the plan says "V1 creates new session", the code should at minimum validate the original session exists (return 404 if not) or accept the behavior is documented as intentional.
+
+**Fix (V1):** Validate original session exists, log warning, then create new session with cross-reference.
+
+---
+
+### [P3] — Medium / Low
+
+#### 7. No session TTL / eviction — memory leak
+
+**File:** `src/caae/engine.py:62`
+
+`_sessions` dict grows unbounded. In long-running server, every session stays in memory forever. For V1 acceptable, but document and add a note for V2.
+
+#### 8. `run_session` thread_id generation fragile with empty-string session_id
+
+**File:** `src/caae/engine.py:163`
+
+```python
+thread_id = session_id or initial_state.session_id or "default"
+```
+
+If both are empty string `""` (falsy in Python), `thread_id` defaults to `"default"`. Two concurrent sessions without IDs would share the checkpointer thread. Mitigated because API always passes a UUID, but the guard is weak.
+
+**Fix:** Use explicit `if session_id is not None` check or always generate UUID as fallback:
+```python
+thread_id = session_id or initial_state.session_id or str(uuid.uuid4())
+```
+
+#### 9. mypy errors on `graph.py:59` — `**kwargs` type incompatibility
+
+**File:** `src/caae/graph.py:56-59`
+
+```python
+kwargs = {}
+if checkpointer is not None:
+    kwargs["checkpointer"] = checkpointer
+compiled: CompiledStateGraph = graph.compile(**kwargs)
+```
+
+Mypy reports 11 errors because `compile()` signature doesn't match `**dict[str, InMemorySaver]`. Does not affect runtime. Two fixes:
+- Add `# type: ignore[arg-type]` on line 59
+- Or call `graph.compile(checkpointer=checkpointer)` unconditionally (the `compile` method accepts `None` for optional args)
+
+Check if langgraph's `compile` accepts None for checkpointer — if so, simplify:
+```python
+compiled = graph.compile(checkpointer=checkpointer)  # type: ignore[arg-type]
+```
+
+#### 10. Test `mock_engine` fixture couples `_sessions` reference
+
+**File:** `tests/integration/test_api.py:31,59`
+
+`engine._sessions = fake_sessions` ties the mock's internal dict to the test's local dict. Works but fragile — if engine internals change (e.g., `_sessions` becomes a `defaultdict`), the mock breaks silently. Better to mock only the public methods (`run_session`, `get_session_state`, `initialize_session` if added) and let the test use the router's behavior through the public API.
+
+#### 11. No test for concurrent session creation
+
+Tests create sessions sequentially. No test verifies multiple concurrent `POST /sessions` work correctly (two tasks, two session IDs, no key collision).
+
+---
+
+## Positive Observations
+
+| Area | Note |
+|------|------|
+| **Lifespan** | `@asynccontextmanager` pattern correct — init on startup, cleanup on shutdown. Env-var config paths with defaults. |
+| **Non-blocking POST** | `asyncio.create_task()` correctly avoids blocking the API response. User gets `session_id` immediately. |
+| **Error handling (GET)** | `GET /sessions/{id}` returns proper 404 for unknown sessions. `GET /health/mcp-servers` gracefully returns empty if config not loaded. |
+| **Test suite** | 219/219 passing. All endpoints covered with happy path + error cases (404, full flow). Tests cleanly separate from real MCP/LLM services. |
+| **Ruff** | Zero lint violations across entire `src/`. |
+| **Backward compat** | `build_caae_graph()` default `checkpointer=None` preserves all existing test signatures. Engine unit tests and graph integration tests unchanged. |
+| **Type hints** | Consistent use of `dict[str, Any]`, `str | None`, Pydantic `BaseModel` subclasses. `cast(RunnableConfig, config)` used where needed. |
+| **MemorySaver** | Correctly wired as `checkpointer` to `build_caae_graph`. Engine handles dict vs model return type from `ainvoke` with `isinstance` check. |
+| **MCP health** | `get_mcp_server_statuses()` correctly diff `connected_server_names` vs `mcp_config.mcp_servers` to detect failed-connect servers. |
+| **Graph nodes** | Each node handles dict/Pydantic normalization, unknown intent early-exit, and budget checks. Well-structured. |
+
+---
+
+## Acceptance Criteria Verification
+
+| Criteria | Status | Details |
+|----------|--------|---------|
+| `POST /sessions` returns `session_id` | ✅ | Returns `SessionCreateResponse` with UUID. |
+| `GET /sessions/{id}` returns current/final state | ⚠️ | Works, but stale placeholder on failure (see P1-1). |
+| Health endpoint shows MCP server connectivity | ✅ | `GET /health/mcp-servers` returns per-server `connected`/`disconnected`. |
+| Full flow: create → graph runs → state via GET | ✅ | Works in tests; `asyncio.sleep(0)` yields to background task. |
+| Non-blocking POST | ✅ | `asyncio.create_task`, immediate return. |
+| MemorySaver wired | ✅ | Created in `start()`, passed to `build_caae_graph`. |
 
 ---
 
 ## Suggested Next Steps
 
-- [ ] **[P0]** Fix the streamable_http 3-tuple → 2-tuple unpacking bug in `client_manager.py` (also fix `mock_transport_cm` to use 3-tuple for streamable_http tests)
-- [ ] **[P1]** Add `appointment_id` to the `cancel_appointment` "not_found" return dict
-- [ ] **[P2]** Wrap `_generate_slots_for_date` in try/except for invalid date strings
-- [ ] **[P2]** Add optional `status` filter to `list_appointments_for_practitioner`
-- [ ] **[P2]** Consider consolidating `scheduling_engine` / `demo_scheduling` config entries
-- [ ] **[P3]** Differentiate return statuses for unknown-practitioner vs genuinely-booked slots
-- [ ] **Test**: Add unit test for `data.py` functions directly (faster feedback than full integration tests)
-- [ ] **Test**: After P0 fix, add integration test that exercises streamable_http transport (mock HTTP server)
+1. **Fix P1-1 (fire-and-forget error handling)** — highest priority. Wrap `run_session` call in an exception handler that stores error state in `_sessions`.
+2. **Fix P1-2 (cancel returns 501)** — one-line change.
+3. **Add `initialize_session` public method** (P2-3) — clean up route encapsulation.
+4. **Add checkpointer test to graph integration** (P2-5) — 1 test, verify `ainvoke` return type with MemorySaver.
+5. **Add error-state test to API integration** — mock `run_session` to raise, verify `GET` returns error state.
+6. **Address mypy errors** (P3-9) or add to ignore list with TODO.
+7. **Document memory limitation** (P3-7) — `_sessions` in-memory, no eviction, acceptable for V1.

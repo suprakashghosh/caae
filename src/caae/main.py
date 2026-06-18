@@ -1,5 +1,6 @@
 """FastAPI application entry point for CAAE."""
 
+import os
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -7,14 +8,29 @@ from fastapi import FastAPI
 
 from caae.api.routes.health import router as health_router
 from caae.api.routes.sessions import router as sessions_router
+from caae.engine import CAAEEngine
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Placeholder lifespan handler for startup/shutdown events."""
-    # TODO: Initialize engine, MCP clients, observability in subsequent sub-tasks
+    """Lifespan handler — initialises engine and cleans up on shutdown."""
+    mcp_config_path = os.environ.get(
+        "CAAE_MCP_CONFIG",
+        "configs/mcp_config.json",
+    )
+    workflow_policy_path = os.environ.get(
+        "CAAE_WORKFLOW_POLICY",
+        "configs/workflow_policy.json",
+    )
+
+    engine = CAAEEngine(
+        mcp_config_path=mcp_config_path,
+        workflow_policy_path=workflow_policy_path,
+    )
+    await engine.start()
+    app.state.engine = engine
     yield
-    # TODO: Cleanup resources in subsequent sub-tasks
+    await engine.stop()
 
 
 app = FastAPI(

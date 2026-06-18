@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+import uuid
+from typing import Any, cast
 
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.state import CompiledStateGraph
 
 from caae.config.loader import load_mcp_config, load_workflow_policy
 from caae.graph import build_caae_graph
 from caae.mcp.client_manager import MCPClientManager
-from caae.models.config import WorkflowPolicy
+from caae.models.config import MCPConfig, WorkflowPolicy
 from caae.models.schemas import SchemaRegistry, get_default_registry
 from caae.models.state import UnifiedContextState
 from caae.nodes.deps import Dependencies
@@ -49,6 +52,7 @@ class CAAEEngine:
         self._llm_provider = llm_provider
 
         # Populated during start()
+        self._mcp_config: MCPConfig | None = None
         self._mcp_client: MCPClientManager | None = None
         self._workflow_policy: WorkflowPolicy | None = None
         self._schema_registry: SchemaRegistry | None = None
@@ -58,6 +62,18 @@ class CAAEEngine:
         # In-memory session store (V1)
         self._sessions: dict[str, dict[str, Any]] = {}
 
+    def initialize_session(self, session_id: str, payload: dict[str, Any]) -> None:
+        """Initialize a session placeholder in the in-memory store.
+
+        Args:
+            session_id: Unique session identifier.
+            payload: Inbound event payload dict.
+        """
+        self._sessions[session_id] = UnifiedContextState(
+            session_id=session_id,
+            inbound_event_payload=payload,
+        ).model_dump()
+
     async def start(self) -> None:
         """Load configuration, start MCP connections, and compile the LangGraph.
 
@@ -66,6 +82,7 @@ class CAAEEngine:
             ConfigLoadError: If a config file is invalid.
         """
         mcp_config = load_mcp_config(self._mcp_config_path)
+        self._mcp_config = mcp_config
         self._workflow_policy = load_workflow_policy(self._workflow_policy_path)
         self._schema_registry = get_default_registry()
 
@@ -78,7 +95,8 @@ class CAAEEngine:
         if self._langfuse_handler.enabled:
             mcp_client.set_langfuse_handler(self._langfuse_handler)
 
-        self._graph = build_caae_graph()
+        checkpointer = MemorySaver()
+        self._graph = build_caae_graph(checkpointer=checkpointer)
 
         logger.info("CAAEEngine started successfully")
 
@@ -94,7 +112,7 @@ class CAAEEngine:
 
         logger.info("CAAEEngine stopped")
 
-    async def run_session(self, event: dict[str, Any]) -> dict[str, Any]:
+    async def run_session(self, event: dict[str, Any], session_id: str | None = None) -> dict[str, Any]:
         """Execute a full CAAE workflow session for the given event.
 
         Creates an initial ``UnifiedContextState`` from the event, injects
@@ -103,6 +121,7 @@ class CAAEEngine:
 
         Args:
             event: The inbound event payload dict.
+            session_id: Optional session ID. If not provided, the graph generates one.
 
         Returns:
             The final state dict produced by graph execution.
@@ -115,7 +134,7 @@ class CAAEEngine:
 
         # Build initial state from the inbound event
         initial_state = UnifiedContextState(
-            session_id="",
+            session_id=session_id or "",
             inbound_event_payload=event,
         )
 
@@ -130,6 +149,12 @@ class CAAEEngine:
             if trace_span is not None:
                 trace_context["trace_root_id"] = str(id(trace_span))
             self._mcp_client.set_langfuse_handler(self._langfuse_handler, trace_context)
+
+        # Ensure dependencies are initialized (narrow from Optional)
+        if self._workflow_policy is None:
+            raise RuntimeError("Engine not properly initialized: missing workflow_policy")
+        if self._schema_registry is None:
+            raise RuntimeError("Engine not properly initialized: missing schema_registry")
 
         # Assemble runtime dependencies
         deps = Dependencies(
@@ -148,15 +173,22 @@ class CAAEEngine:
         if self._langfuse_handler and self._langfuse_handler.enabled:
             callbacks.append(LangchainCallbackHandler())
 
-        config: dict[str, Any] = {"configurable": {"deps": deps}}
+        thread_id = session_id or initial_state.session_id or str(uuid.uuid4())
+        config: dict[str, Any] = {"configurable": {"deps": deps, "thread_id": thread_id}}
         if callbacks:
             config["callbacks"] = callbacks
 
         # Execute the graph
-        final_state: UnifiedContextState = await self._graph.ainvoke(
+        raw_state: UnifiedContextState | dict[str, Any] = await self._graph.ainvoke(
             initial_state,
-            config=config,
+            config=cast(RunnableConfig, config),
         )
+
+        # Normalise: ainvoke may return dict when checkpointer is used
+        if isinstance(raw_state, dict):
+            final_state = UnifiedContextState.model_validate(raw_state)
+        else:
+            final_state = raw_state
 
         # Serialise and cache the result
         result: dict[str, Any] = final_state.model_dump()
@@ -168,6 +200,23 @@ class CAAEEngine:
 
         return result
 
+    async def _run_session_and_store(self, payload: dict[str, Any], session_id: str) -> None:
+        """Run a session in background and store result, catching failures.
+
+        Args:
+            payload: The inbound event payload dict.
+            session_id: The session identifier.
+        """
+        try:
+            await self.run_session(payload, session_id)
+        except Exception:
+            logger.exception("Session %s failed", session_id)
+            self._sessions[session_id] = {
+                **self._sessions.get(session_id, {}),
+                "error": "session execution failed",
+                "evaluation_passed": False,
+            }
+
     def get_session_state(self, session_id: str) -> dict[str, Any] | None:
         """Retrieve a previously completed session's state from the in-memory store.
 
@@ -178,3 +227,26 @@ class CAAEEngine:
             The session state dict, or ``None`` if no session with that ID exists.
         """
         return self._sessions.get(session_id)
+
+    def get_mcp_server_statuses(self) -> dict[str, dict[str, Any]]:
+        """Get the connection status of all configured MCP servers.
+
+        Returns:
+            A dict mapping server names to ``{"status": "connected"|"disconnected", ...}``.
+        """
+        statuses: dict[str, dict[str, Any]] = {}
+        if self._mcp_config is None or self._mcp_client is None:
+            return statuses
+
+        connected = set(self._mcp_client.connected_server_names)
+        configured = set(self._mcp_config.mcp_servers.keys())
+
+        for server_name in configured:
+            if server_name in connected:
+                statuses[server_name] = {"status": "connected"}
+            else:
+                statuses[server_name] = {
+                    "status": "disconnected",
+                    "error": "Server not connected during startup",
+                }
+        return statuses

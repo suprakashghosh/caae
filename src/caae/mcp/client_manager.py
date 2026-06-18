@@ -60,6 +60,11 @@ class MCPClientManager:
         self._langfuse_handler: Any = None  # Optional LangfuseHandler
         self._trace_context: dict[str, Any] | None = None
 
+    @property
+    def connected_server_names(self) -> list[str]:
+        """Return names of currently connected MCP servers (synchronous)."""
+        return list(self._servers.keys())
+
     def set_langfuse_handler(self, handler: Any, trace_context: dict[str, Any] | None = None) -> None:
         """Set the Langfuse handler for tool call tracing.
 
